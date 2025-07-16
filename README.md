@@ -1,108 +1,116 @@
 # Go Streaming Client for FastAPI Server
 
-This project provides robust Go clients for handling Server-Sent Events (SSE) streaming from a FastAPI server. It includes both basic and advanced implementations with comprehensive error handling, retry logic, and graceful stream management.
+A robust, production-ready Go client for handling Server-Sent Events (SSE) streaming from a FastAPI server. Features circuit breaker pattern, comprehensive error handling, retry logic, and response data collection.
 
-## Features
+## 🚀 Features
 
-### Basic Client (`main.go`)
-- Simple retry logic with exponential backoff
-- Graceful error handling for stream failures
-- Context cancellation support
-- Signal handling for graceful shutdown
-- Proper HTTP connection management
-
-### Advanced Client (`advanced_client.go`)
-- **Circuit Breaker Pattern**: Prevents cascading failures
+- **Circuit Breaker Pattern**: Prevents cascading failures with automatic recovery
+- **Response Data Collection**: Captures and returns all streamed events
+- **Exponential Backoff**: Intelligent retry logic with jitter
+- **Real-time Processing**: Events displayed as they arrive
+- **Comprehensive Metrics**: Success rates, retry counts, performance tracking
+- **Graceful Shutdown**: Signal handling and context cancellation
 - **Connection Pooling**: Efficient HTTP connection management
-- **Detailed Metrics**: Track success rates, retry counts, and performance
-- **Enhanced Error Handling**: Sophisticated error classification and recovery
-- **Exponential Backoff with Jitter**: Prevents thundering herd problems
-- **Atomic Operations**: Thread-safe metrics and state management
+- **Error Classification**: Different handling for different error types
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 streamingdemo/
-├── main.go              # Basic streaming client
-├── advanced_client.go   # Advanced client with circuit breaker
-├── demo.go             # Demo functions for both clients
-├── go.mod              # Go module dependencies
-└── README.md           # This file
+├── streaming_client.go    # Main streaming client (single file)
+├── go.mod                # Go module dependencies
+└── README.md             # This file
 ```
 
-## Prerequisites
+## 🛠️ Prerequisites
 
 - Go 1.21 or later
-- FastAPI server running on `http://localhost:8000` (or modify the URL in the code)
+- FastAPI server running on `http://localhost:8000` with `/trigger_invocation` endpoint
 
-## Installation
+## ⚡ Quick Start
 
-1. Clone or download the project files
-2. Install dependencies:
-   ```bash
-   go mod tidy
-   ```
-
-## Usage
-
-### Running the Basic Client
-
+### 1. Install Dependencies
 ```bash
-go run .
+go mod tidy
 ```
 
-### Running the Advanced Client
-
+### 2. Run the Client
 ```bash
-go run . advanced
+go run streaming_client.go
 ```
 
-### Using Demo Functions
+### 3. Expected Output
+```
+Starting advanced stream to http://localhost:8000
+Press Ctrl+C to stop
+Event 1: Event 1
+Event 2: Event 2
+Event 3: Event 3
+Event 4: Event 4
+Message: Stream completed
 
-You can also use the demo functions in your own code:
+=== Streaming Metrics ===
+Duration: 26.79s
+Total Events: 1
+Successful: 1
+Failed: 0
+Retries: 0
+Success Rate: 100.0%
+=======================
+Stream completed successfully
+
+=== Collected Response Data ===
+Event 1: Event 1
+Event 2: Event 2
+Event 3: Event 3
+Event 4: Event 4
+Message 1: Stream completed
+Total responses collected: 5
+==============================
+```
+
+## 🔧 Configuration
+
+The client uses sensible defaults but can be customized:
 
 ```go
-package main
-
-import "streamingdemo"
-
-func main() {
-    // Run basic client demo
-    DemoBasicClient()
-
-    // Or run advanced client demo
-    DemoAdvancedClient()
-
-    // Or run multiple concurrent streams
-    DemoMultipleStreams()
+config := Config{
+    BaseURL:    "http://localhost:8000",
+    Timeout:    30 * time.Second,
+    MaxRetries: 3,
+    CircuitBreaker: CircuitBreakerConfig{
+        FailureThreshold: 3,
+        Timeout:          30 * time.Second,
+    },
+    HTTP: HTTPConfig{
+        MaxIdleConns:        100,
+        MaxIdleConnsPerHost: 10,
+        IdleConnTimeout:     90 * time.Second,
+    },
 }
 ```
 
-## Configuration
+## 📊 Response Data Collection
 
-### Basic Client Configuration
-
-```go
-baseURL := "http://localhost:8000"
-timeout := 30 * time.Second
-maxRetries := 3
-
-client := NewStreamClient(baseURL, timeout)
-```
-
-### Advanced Client Configuration
+The client now **collects and returns all response data**:
 
 ```go
-baseURL := "http://localhost:8000"
-timeout := 30 * time.Second
-maxRetries := 3
+responses, err := service.StreamWithRetry(ctx, requestBody, config.MaxRetries)
+if err != nil {
+    // Handle error
+}
 
-client := NewAdvancedStreamClient(baseURL, timeout)
+// Access collected data
+for i, response := range responses {
+    if response.Count > 0 {
+        fmt.Printf("Event %d: %s\n", response.Count, response.Data)
+    } else {
+        fmt.Printf("Message %d: %s\n", i+1, response.Data)
+    }
+}
 ```
 
-## Error Handling
-
-The clients handle various types of errors gracefully:
+## 🛡️ Error Handling
 
 ### Network Errors
 - Connection timeouts
@@ -125,139 +133,164 @@ The clients handle various types of errors gracefully:
 - Context cancellation
 - Signal interrupts (Ctrl+C)
 
-## Retry Logic
+## 🔄 Retry Logic
 
-### Basic Client
-- Simple retry with exponential backoff
-- Configurable max retry attempts
-- Skips retries for certain error types
-
-### Advanced Client
-- Circuit breaker pattern prevents cascading failures
-- Exponential backoff with jitter
-- Sophisticated error classification
-- Automatic recovery after timeout
-
-## Circuit Breaker Pattern
-
-The advanced client implements a circuit breaker with three states:
-
+### Circuit Breaker States
 1. **Closed**: Normal operation, requests pass through
-2. **Open**: Requests are blocked due to high failure rate
+2. **Open**: Requests blocked due to high failure rate
 3. **Half-Open**: Limited requests allowed to test recovery
 
-Configuration:
-- Failure threshold: 3 consecutive failures
-- Timeout: 30 seconds before attempting recovery
+### Backoff Strategy
+- **Exponential backoff**: `attempt²` seconds
+- **Jitter**: `attempt * 500ms` to prevent thundering herd
+- **Smart retry**: Skips retries for certain error types
 
-## Metrics and Monitoring
+## 📈 Metrics and Monitoring
 
-The advanced client provides detailed metrics:
+The client provides detailed metrics:
 
-- Total events processed
-- Successful events count
-- Failed events count
-- Retry attempts
-- Stream duration
-- Success rate percentage
+- **Total Events**: Number of events processed
+- **Successful Events**: Successfully processed events
+- **Failed Events**: Failed event processing
+- **Retry Count**: Number of retry attempts
+- **Duration**: Total streaming time
+- **Success Rate**: Percentage of successful events
 
-Example output:
-```
-=== Streaming Metrics ===
-Duration: 15.234s
-Total Events: 6
-Successful Events: 5
-Failed Events: 1
-Retry Count: 2
-Success Rate: 83.33%
-=======================
-```
+## 🎯 Usage Examples
 
-## Graceful Shutdown
-
-Both clients support graceful shutdown:
-
-1. **Signal Handling**: Responds to SIGINT and SIGTERM
-2. **Context Cancellation**: Supports context-based cancellation
-3. **Resource Cleanup**: Properly closes HTTP connections
-4. **In-flight Request Handling**: Cancels ongoing requests
-
-## Best Practices
-
-### For Production Use
-
-1. **Configure Timeouts**: Set appropriate timeouts based on your server's response times
-2. **Monitor Metrics**: Use the advanced client's metrics for monitoring
-3. **Handle Errors**: Implement proper error handling in your application
-4. **Resource Management**: Always call `GracefulShutdown()` when done
-5. **Connection Pooling**: Use the advanced client for high-throughput scenarios
-
-### Error Recovery
-
+### Basic Usage
 ```go
-client := NewAdvancedStreamClient(baseURL, timeout)
-defer client.GracefulShutdown()
+config := DefaultConfig()
+service := NewStreamService(config)
+defer service.client.GracefulShutdown()
 
 ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 defer cancel()
 
-err := client.StreamWithAdvancedRetry(ctx, requestBody, 3)
+requestBody := BodyRequest{Query: "test query"}
+responses, err := service.StreamWithRetry(ctx, requestBody, 3)
+
 if err != nil {
-    // Handle error appropriately
     log.Printf("Stream failed: %v", err)
-    // Implement fallback logic or alerting
+} else {
+    fmt.Printf("Collected %d responses\n", len(responses))
 }
 ```
 
-## Testing with FastAPI Server
-
-Make sure your FastAPI server is running:
-
-```python
-# Your FastAPI server code
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-# ... rest of your server code
-
-# Run with: uvicorn main:app --reload
+### Custom Configuration
+```go
+config := Config{
+    BaseURL:    "http://my-server:8080",
+    Timeout:    60 * time.Second,
+    MaxRetries: 5,
+    CircuitBreaker: CircuitBreakerConfig{
+        FailureThreshold: 5,
+        Timeout:          60 * time.Second,
+    },
+}
 ```
 
-Then run the Go client:
+## 🧪 Testing
 
+### Test with Running Server
 ```bash
-# Basic client
-go run .
+# Start your FastAPI server first
+uvicorn main:app --reload
 
-# Advanced client
-go run . advanced
+# Then run the Go client
+go run streaming_client.go
 ```
 
-## Troubleshooting
+### Test Error Scenarios
+The client handles various failure scenarios:
+- Server not running → Circuit breaker opens after 3 failures
+- Network timeouts → Automatic retry with backoff
+- Server shutdown mid-stream → Graceful error handling
+- Context cancellation → Immediate shutdown
+
+## 🔍 Server Shutdown Behavior
+
+When the server shuts down mid-request:
+
+1. **During HTTP request**: Connection error → Retry with backoff
+2. **During stream processing**: EOF/connection reset → Retry with backoff
+3. **After partial response**: JSON parsing may fail → Treated as failed event
+4. **Circuit breaker protection**: Prevents overwhelming failing services
+
+## 🚀 Production Features
+
+- **Thread-safe**: Atomic operations for metrics and state
+- **Resource management**: Proper connection cleanup
+- **Signal handling**: Graceful shutdown on SIGINT/SIGTERM
+- **Context support**: Cancellation and timeout handling
+- **Memory efficient**: Streaming processing without buffering entire response
+
+## 📝 API Reference
+
+### Main Types
+```go
+type StreamResponse struct {
+    Count int    `json:"Count,omitempty"`
+    Data  string `json:"Data"`
+    Error string `json:"error,omitempty"`
+}
+
+type BodyRequest struct {
+    Query string `json:"query"`
+}
+
+type StreamClient struct {
+    // HTTP client, circuit breaker, metrics, processor
+}
+
+type StreamService struct {
+    client *StreamClient
+}
+```
+
+### Key Methods
+```go
+// Create new service
+service := NewStreamService(config)
+
+// Stream with retry logic
+responses, err := service.StreamWithRetry(ctx, requestBody, maxRetries)
+
+// Get metrics
+metrics := service.client.GetMetrics()
+
+// Graceful shutdown
+service.client.GracefulShutdown()
+```
+
+## 🐛 Troubleshooting
 
 ### Common Issues
 
-1. **Connection Refused**: Ensure the FastAPI server is running
-2. **Timeout Errors**: Increase the timeout duration
-3. **Circuit Breaker Open**: Wait for recovery or restart the client
-4. **JSON Parsing Errors**: Check server response format
+1. **Connection Refused**
+   - Ensure FastAPI server is running on `localhost:8000`
+   - Check if port 8000 is available
+
+2. **Circuit Breaker Open**
+   - Server is down or overloaded
+   - Wait for recovery timeout (30s default)
+   - Check server health
+
+3. **Timeout Errors**
+   - Increase timeout in configuration
+   - Check server response times
+
+4. **JSON Parsing Errors**
+   - Verify server response format
+   - Check for malformed SSE data
 
 ### Debug Mode
-
-Add debug logging by modifying the client code:
-
+Add debug logging by modifying the stream processing:
 ```go
-// Add debug prints in the stream processing functions
 fmt.Printf("Debug: Processing line: %s\n", line)
 ```
 
-## Performance Considerations
-
-- **Connection Pooling**: The advanced client reuses HTTP connections
-- **Buffer Management**: Large message buffers prevent scanner errors
-- **Concurrent Streams**: Use goroutines for multiple streams
-- **Memory Management**: Proper cleanup prevents memory leaks
-
-## Contributing
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -265,6 +298,10 @@ fmt.Printf("Debug: Processing line: %s\n", line)
 4. Add tests if applicable
 5. Submit a pull request
 
-## License
+## 📄 License
 
 This project is provided as-is for educational and production use.
+
+---
+
+**Ready to use!** Just run `go run streaming_client.go` with your FastAPI server running. 🎉
