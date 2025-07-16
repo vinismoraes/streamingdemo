@@ -17,6 +17,79 @@ import (
 	"time"
 )
 
+// ErrorType represents different categories of errors
+type ErrorType int
+
+const (
+	ErrorTypeUnknown ErrorType = iota
+	ErrorTypeNetwork
+	ErrorTypeServer
+	ErrorTypeClient
+	ErrorTypeTimeout
+	ErrorTypeCircuitBreaker
+	ErrorTypeStreamClosed
+	ErrorTypeInvalidResponse
+)
+
+// ErrorInfo contains detailed error information
+type ErrorInfo struct {
+	Type       ErrorType
+	Message    string
+	Retryable  bool
+	StatusCode int
+}
+
+// String returns the string representation of ErrorType
+func (et ErrorType) String() string {
+	switch et {
+	case ErrorTypeNetwork:
+		return "Network"
+	case ErrorTypeServer:
+		return "Server"
+	case ErrorTypeClient:
+		return "Client"
+	case ErrorTypeTimeout:
+		return "Timeout"
+	case ErrorTypeCircuitBreaker:
+		return "CircuitBreaker"
+	case ErrorTypeStreamClosed:
+		return "StreamClosed"
+	case ErrorTypeInvalidResponse:
+		return "InvalidResponse"
+	default:
+		return "Unknown"
+	}
+}
+
+// ClassifiedError wraps an error with classification information
+type ClassifiedError struct {
+	Err  error
+	Info ErrorInfo
+}
+
+func (ce *ClassifiedError) Error() string {
+	return fmt.Sprintf("[%s] %s", ce.Info.Type.String(), ce.Err.Error())
+}
+
+func (ce *ClassifiedError) Unwrap() error {
+	return ce.Err
+}
+
+// HealthStatus represents server health information
+type HealthStatus struct {
+	Healthy      bool
+	LastCheck    time.Time
+	ResponseTime time.Duration
+	StatusCode   int
+	Error        error
+}
+
+// HealthChecker interface for health check functionality
+type HealthChecker interface {
+	CheckHealth(ctx context.Context) HealthStatus
+	IsHealthy() bool
+}
+
 // StreamResponse represents the server response structure
 type StreamResponse struct {
 	Count int    `json:"Count,omitempty"`
@@ -36,6 +109,7 @@ type Config struct {
 	MaxRetries     int
 	CircuitBreaker CircuitBreakerConfig
 	HTTP           HTTPConfig
+	HealthCheck    HealthCheckConfig
 }
 
 // CircuitBreakerConfig holds circuit breaker settings
@@ -49,6 +123,14 @@ type HTTPConfig struct {
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
 	IdleConnTimeout     time.Duration
+}
+
+// HealthCheckConfig holds health check settings
+type HealthCheckConfig struct {
+	Enabled  bool
+	Interval time.Duration
+	Timeout  time.Duration
+	Endpoint string
 }
 
 // DefaultConfig returns a default configuration
@@ -66,6 +148,12 @@ func DefaultConfig() Config {
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
 		},
+		HealthCheck: HealthCheckConfig{
+			Enabled:  true,
+			Interval: 30 * time.Second,
+			Timeout:  5 * time.Second,
+			Endpoint: "/health",
+		},
 	}
 }
 
@@ -76,6 +164,35 @@ type Metrics struct {
 	failedEvents  int64
 	retryCount    int64
 	startTime     time.Time
+	errorCounts   map[ErrorType]int64
+	mu            sync.RWMutex
+}
+
+// NewMetrics creates a new metrics instance
+func NewMetrics() *Metrics {
+	return &Metrics{
+		startTime:   time.Now(),
+		errorCounts: make(map[ErrorType]int64),
+	}
+}
+
+// RecordError records an error by type
+func (m *Metrics) RecordError(errorType ErrorType) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.errorCounts[errorType]++
+}
+
+// GetErrorCounts returns a copy of error counts
+func (m *Metrics) GetErrorCounts() map[ErrorType]int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	counts := make(map[ErrorType]int64)
+	for k, v := range m.errorCounts {
+		counts[k] = v
+	}
+	return counts
 }
 
 // CircuitBreaker implements circuit breaker pattern
@@ -113,6 +230,8 @@ type StreamClient struct {
 	circuitBreaker *CircuitBreaker
 	metrics        *Metrics
 	processor      StreamProcessor
+	healthChecker  HealthChecker
+	config         Config
 }
 
 // NewStreamClient creates a new streaming client
@@ -133,8 +252,14 @@ func NewStreamClient(config Config) *StreamClient {
 		baseURL:        config.BaseURL,
 		timeout:        config.Timeout,
 		circuitBreaker: NewCircuitBreaker(config.CircuitBreaker),
-		metrics:        &Metrics{startTime: time.Now()},
+		metrics:        NewMetrics(),
 		processor:      &DefaultStreamProcessor{},
+		config:         config,
+	}
+
+	// Initialize health checker if enabled
+	if config.HealthCheck.Enabled {
+		streamClient.healthChecker = NewHealthChecker(streamClient, config.HealthCheck)
 	}
 
 	return streamClient
@@ -153,7 +278,14 @@ func (p *DefaultStreamProcessor) ProcessStream(ctx context.Context, body io.Read
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return responses, fmt.Errorf("context cancelled: %w", ctx.Err())
+			return responses, &ClassifiedError{
+				Err: fmt.Errorf("context cancelled: %w", ctx.Err()),
+				Info: ErrorInfo{
+					Type:      ErrorTypeStreamClosed,
+					Message:   "Stream cancelled by context",
+					Retryable: false,
+				},
+			}
 		default:
 		}
 
@@ -172,9 +304,23 @@ func (p *DefaultStreamProcessor) ProcessStream(ctx context.Context, body io.Read
 		if response.Error != "" {
 			if strings.Contains(response.Error, "cancelled") ||
 				strings.Contains(response.Error, "timed out") {
-				return responses, fmt.Errorf("stream %s", response.Error)
+				return responses, &ClassifiedError{
+					Err: fmt.Errorf("stream %s", response.Error),
+					Info: ErrorInfo{
+						Type:      ErrorTypeStreamClosed,
+						Message:   response.Error,
+						Retryable: false,
+					},
+				}
 			}
-			return responses, fmt.Errorf("server error: %s", response.Error)
+			return responses, &ClassifiedError{
+				Err: fmt.Errorf("server error: %s", response.Error),
+				Info: ErrorInfo{
+					Type:      ErrorTypeServer,
+					Message:   response.Error,
+					Retryable: true,
+				},
+			}
 		}
 
 		// Add response to collection
@@ -192,10 +338,24 @@ func (p *DefaultStreamProcessor) ProcessStream(ctx context.Context, body io.Read
 	}
 
 	if err := scanner.Err(); err != nil {
-		return responses, fmt.Errorf("scanner error: %w", err)
+		return responses, &ClassifiedError{
+			Err: fmt.Errorf("scanner error: %w", err),
+			Info: ErrorInfo{
+				Type:      ErrorTypeStreamClosed,
+				Message:   "Scanner error during stream processing",
+				Retryable: true,
+			},
+		}
 	}
 
-	return responses, fmt.Errorf("stream ended unexpectedly")
+	return responses, &ClassifiedError{
+		Err: fmt.Errorf("stream ended unexpectedly"),
+		Info: ErrorInfo{
+			Type:      ErrorTypeStreamClosed,
+			Message:   "Stream ended without completion",
+			Retryable: true,
+		},
+	}
 }
 
 // StreamService handles the streaming business logic
@@ -217,7 +377,16 @@ func (s *StreamService) StreamWithRetry(ctx context.Context, req BodyRequest, ma
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if !s.client.circuitBreaker.canExecute() {
-			return nil, fmt.Errorf("circuit breaker open")
+			err := &ClassifiedError{
+				Err: fmt.Errorf("circuit breaker open"),
+				Info: ErrorInfo{
+					Type:      ErrorTypeCircuitBreaker,
+					Message:   "Circuit breaker is open",
+					Retryable: false,
+				},
+			}
+			s.client.metrics.RecordError(ErrorTypeCircuitBreaker)
+			return nil, err
 		}
 
 		if attempt > 0 {
@@ -225,7 +394,14 @@ func (s *StreamService) StreamWithRetry(ctx context.Context, req BodyRequest, ma
 			backoff := s.calculateBackoff(attempt)
 			select {
 			case <-ctx.Done():
-				return lastResponses, fmt.Errorf("context cancelled: %w", ctx.Err())
+				return lastResponses, &ClassifiedError{
+					Err: fmt.Errorf("context cancelled: %w", ctx.Err()),
+					Info: ErrorInfo{
+						Type:      ErrorTypeStreamClosed,
+						Message:   "Context cancelled during retry",
+						Retryable: false,
+					},
+				}
 			case <-time.After(backoff):
 			}
 		}
@@ -240,12 +416,26 @@ func (s *StreamService) StreamWithRetry(ctx context.Context, req BodyRequest, ma
 		lastResponses = responses
 		s.client.circuitBreaker.recordFailure()
 
+		// Classify and record the error
+		if classifiedErr, ok := err.(*ClassifiedError); ok {
+			s.client.metrics.RecordError(classifiedErr.Info.Type)
+		} else {
+			s.client.metrics.RecordError(ErrorTypeUnknown)
+		}
+
 		if ctx.Err() != nil || s.shouldNotRetry(err) {
 			return lastResponses, err
 		}
 	}
 
-	return lastResponses, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+	return lastResponses, &ClassifiedError{
+		Err: fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr),
+		Info: ErrorInfo{
+			Type:      ErrorTypeUnknown,
+			Message:   "Max retries exceeded",
+			Retryable: false,
+		},
+	}
 }
 
 // calculateBackoff calculates exponential backoff with jitter
@@ -257,6 +447,10 @@ func (s *StreamService) calculateBackoff(attempt int) time.Duration {
 
 // shouldNotRetry determines if an error should not be retried
 func (s *StreamService) shouldNotRetry(err error) bool {
+	if classifiedErr, ok := err.(*ClassifiedError); ok {
+		return !classifiedErr.Info.Retryable
+	}
+
 	errStr := err.Error()
 	return strings.Contains(errStr, "cancelled") ||
 		strings.Contains(errStr, "completed") ||
@@ -268,13 +462,27 @@ func (c *StreamClient) stream(ctx context.Context, req BodyRequest) ([]StreamRes
 	jsonBody, err := json.Marshal(req)
 	if err != nil {
 		atomic.AddInt64(&c.metrics.failedEvents, 1)
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, &ClassifiedError{
+			Err: fmt.Errorf("failed to marshal request: %w", err),
+			Info: ErrorInfo{
+				Type:      ErrorTypeClient,
+				Message:   "Request marshaling failed",
+				Retryable: false,
+			},
+		}
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/trigger_invocation", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		atomic.AddInt64(&c.metrics.failedEvents, 1)
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, &ClassifiedError{
+			Err: fmt.Errorf("failed to create request: %w", err),
+			Info: ErrorInfo{
+				Type:      ErrorTypeClient,
+				Message:   "Request creation failed",
+				Retryable: false,
+			},
+		}
 	}
 
 	c.setHeaders(httpReq)
@@ -282,7 +490,21 @@ func (c *StreamClient) stream(ctx context.Context, req BodyRequest) ([]StreamRes
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		atomic.AddInt64(&c.metrics.failedEvents, 1)
-		return nil, fmt.Errorf("request failed: %w", err)
+
+		// Classify network errors
+		errorType := ErrorTypeNetwork
+		if strings.Contains(err.Error(), "timeout") {
+			errorType = ErrorTypeTimeout
+		}
+
+		return nil, &ClassifiedError{
+			Err: fmt.Errorf("request failed: %w", err),
+			Info: ErrorInfo{
+				Type:      errorType,
+				Message:   "HTTP request failed",
+				Retryable: true,
+			},
+		}
 	}
 	defer resp.Body.Close()
 
@@ -306,12 +528,33 @@ func (c *StreamClient) setHeaders(req *http.Request) {
 func (c *StreamClient) validateResponse(resp *http.Response) error {
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(bodyBytes))
+
+		errorType := ErrorTypeServer
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			errorType = ErrorTypeClient
+		}
+
+		return &ClassifiedError{
+			Err: fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(bodyBytes)),
+			Info: ErrorInfo{
+				Type:       errorType,
+				Message:    fmt.Sprintf("HTTP %d error", resp.StatusCode),
+				Retryable:  resp.StatusCode >= 500,
+				StatusCode: resp.StatusCode,
+			},
+		}
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/event-stream") {
-		return fmt.Errorf("unexpected content type: %s", contentType)
+		return &ClassifiedError{
+			Err: fmt.Errorf("unexpected content type: %s", contentType),
+			Info: ErrorInfo{
+				Type:      ErrorTypeInvalidResponse,
+				Message:   "Invalid content type",
+				Retryable: false,
+			},
+		}
 	}
 
 	return nil
@@ -380,6 +623,7 @@ func (c *StreamClient) GetMetrics() Metrics {
 		failedEvents:  atomic.LoadInt64(&c.metrics.failedEvents),
 		retryCount:    atomic.LoadInt64(&c.metrics.retryCount),
 		startTime:     c.metrics.startTime,
+		errorCounts:   c.metrics.GetErrorCounts(),
 	}
 }
 
@@ -399,12 +643,116 @@ func (c *StreamClient) printMetrics() {
 		successRate := float64(metrics.successEvents) / float64(metrics.totalEvents) * 100
 		fmt.Printf("Success Rate: %.1f%%\n", successRate)
 	}
+
+	// Print error breakdown
+	if len(metrics.errorCounts) > 0 {
+		fmt.Printf("\nError Breakdown:\n")
+		for errorType, count := range metrics.errorCounts {
+			fmt.Printf("  %s: %d\n", errorType.String(), count)
+		}
+	}
 	fmt.Printf("=======================\n")
 }
 
 // GracefulShutdown handles cleanup
 func (c *StreamClient) GracefulShutdown() {
 	c.client.CloseIdleConnections()
+}
+
+// HealthChecker implementation
+type DefaultHealthChecker struct {
+	client *StreamClient
+	config HealthCheckConfig
+	status HealthStatus
+	mu     sync.RWMutex
+}
+
+// NewHealthChecker creates a new health checker
+func NewHealthChecker(client *StreamClient, config HealthCheckConfig) *DefaultHealthChecker {
+	return &DefaultHealthChecker{
+		client: client,
+		config: config,
+		status: HealthStatus{Healthy: false},
+	}
+}
+
+// CheckHealth performs a health check
+func (hc *DefaultHealthChecker) CheckHealth(ctx context.Context) HealthStatus {
+	start := time.Now()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", hc.client.baseURL+hc.config.Endpoint, nil)
+	if err != nil {
+		hc.updateStatus(HealthStatus{
+			Healthy:   false,
+			LastCheck: time.Now(),
+			Error:     err,
+		})
+		return hc.getStatus()
+	}
+
+	resp, err := hc.client.client.Do(req)
+	if err != nil {
+		hc.updateStatus(HealthStatus{
+			Healthy:      false,
+			LastCheck:    time.Now(),
+			ResponseTime: time.Since(start),
+			Error:        err,
+		})
+		return hc.getStatus()
+	}
+	defer resp.Body.Close()
+
+	healthy := resp.StatusCode == http.StatusOK
+	hc.updateStatus(HealthStatus{
+		Healthy:      healthy,
+		LastCheck:    time.Now(),
+		ResponseTime: time.Since(start),
+		StatusCode:   resp.StatusCode,
+		Error:        nil,
+	})
+
+	return hc.getStatus()
+}
+
+// IsHealthy returns the current health status
+func (hc *DefaultHealthChecker) IsHealthy() bool {
+	hc.mu.RLock()
+	defer hc.mu.RUnlock()
+	return hc.status.Healthy
+}
+
+// updateStatus updates the health status
+func (hc *DefaultHealthChecker) updateStatus(status HealthStatus) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	hc.status = status
+}
+
+// getStatus returns a copy of the current status
+func (hc *DefaultHealthChecker) getStatus() HealthStatus {
+	hc.mu.RLock()
+	defer hc.mu.RUnlock()
+	return hc.status
+}
+
+// GetHealthStatus returns the current health status
+func (c *StreamClient) GetHealthStatus() HealthStatus {
+	if c.healthChecker == nil {
+		return HealthStatus{Healthy: false, Error: fmt.Errorf("health checker not enabled")}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.HealthCheck.Timeout)
+	defer cancel()
+
+	return c.healthChecker.CheckHealth(ctx)
+}
+
+// IsHealthy returns whether the server is healthy
+func (c *StreamClient) IsHealthy() bool {
+	if c.healthChecker == nil {
+		return false
+	}
+	return c.healthChecker.IsHealthy()
 }
 
 func main() {
@@ -424,6 +772,20 @@ func main() {
 		cancel()
 	}()
 
+	// Check server health before starting
+	if config.HealthCheck.Enabled {
+		fmt.Printf("Checking server health at %s%s...\n", config.BaseURL, config.HealthCheck.Endpoint)
+		healthStatus := service.client.GetHealthStatus()
+
+		if healthStatus.Error != nil {
+			fmt.Printf("Health check failed: %v\n", healthStatus.Error)
+			fmt.Println("Proceeding anyway...")
+		} else {
+			fmt.Printf("Server health: %t (Response time: %v, Status: %d)\n",
+				healthStatus.Healthy, healthStatus.ResponseTime, healthStatus.StatusCode)
+		}
+	}
+
 	// Start streaming
 	requestBody := BodyRequest{Query: "advanced streaming test"}
 
@@ -434,7 +796,9 @@ func main() {
 	service.client.printMetrics()
 
 	if err != nil {
-		if ctx.Err() != nil {
+		if classifiedErr, ok := err.(*ClassifiedError); ok {
+			fmt.Printf("Stream failed with %s error: %v\n", classifiedErr.Info.Type.String(), err)
+		} else if ctx.Err() != nil {
 			fmt.Printf("Stream cancelled: %v\n", err)
 		} else {
 			fmt.Printf("Stream failed: %v\n", err)
